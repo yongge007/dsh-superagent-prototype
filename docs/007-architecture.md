@@ -367,6 +367,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
+| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: consumes queued webhooks from WAL SQLite, dispatches Triggers and MR lifecycle updates, and reports health |
+| `src/sources/gitlab-trigger.ts` | Self-hosted GitLab webhook normalization into Triggers and MR lifecycle events, project wildcard scoping (`group/*`, `group/**`), mention/alias detection, and hidden-marker loop prevention |
+| `src/sources/gitlab-mr.ts` | GitLab Merge Request binding (`claimMergeRequest`), webhook lifecycle observation (`observeMergeRequestEvent`), and terminal IM notifications (`mrEndNotices`) |
+| `src/sources/gitlab-channel.ts` | The GitLab Channel: idempotent Issue/MR note and discussion replies with loop-prevention markers, `sent` or `gone`, and URL links |
+| `src/sources/gitlab-read.ts` | GitLab repository file/tree reads, `gitlab/` resources for `orchestrator_read`, and `gitlabThreadContext` for assessments |
+| `src/webhook/gitlab-queue.ts` | WAL-mode SQLite webhook queue and `0600` secret token helpers shared by the standalone receiver and GitLab Source |
+| `src/webhook/gitlab-receiver.ts` | Standalone HTTP receiver (`./gitlab-webhook`) authenticating `X-Gitlab-Token` and appending verified webhook deliveries to the WAL SQLite queue |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
@@ -397,7 +404,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
-`src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
+`src/sources/github.ts`, `src/sources/gitlab.ts`, and `src/sources/feishu.ts` are also the entries of the three Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./gitlab-watch`, and `./feishu-watch` (alongside the standalone webhook entry `./gitlab-webhook` from `src/webhook/gitlab-receiver.ts`). The bundle's `cordis.patch.yml` inserts the four plugins, with GitLab and Feishu disabled by default.
 
 ## Tests
 
@@ -408,6 +415,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
+| `tests/gitlab-webhook.spec.ts` | Standalone GitLab webhook HTTP receiver, `0600` token lifecycle, and WAL SQLite queue deduplication/pruning |
+| `tests/gitlab.spec.ts` | GitLab webhook translation, project wildcards, loop prevention, idempotent channel, threadContext/resource reads, MR lifecycle, and queue consumer plugin |
+| `tests/setup-gitlab.spec.ts` | GitLab deployment verification, GitLab-only Setup and worker shims, `Commands.gitlabApi`, and end-to-end GitLab-only Runtime integration |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

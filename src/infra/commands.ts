@@ -25,8 +25,13 @@ export function commandError(error: unknown, program = 'command'): Error {
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
     if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
-    // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
-    if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
+    // `gh` and `glab` exit non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`, `gh: HTTP 304`, or `GET ...: 404 {message: ...}`).
+    if (stderr) {
+      const status = /\bHTTP (\d{3})\b/.exec(stderr)?.[1]
+        ?? /:\s*([45]\d{2})(?:\s|\{|$)/.exec(stderr)?.[1]
+        ?? /\b([45]\d{2})\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|Gone|Unprocessable|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable)\b/i.exec(stderr)?.[1]
+      return new CliError(stderr.slice(0, 2000), Number(status) || undefined, exitCode)
+    }
   }
   return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
 }
@@ -63,17 +68,25 @@ export class Commands {
    */
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
+  get repository(): string {
+    const repo = this.deployment.repository
+    if (!repo) throw new Error('The GitHub Source is not configured')
+    return repo
+  }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
-  async run(program: string, args: string[], cwd?: string): Promise<string> {
+  async run(program: string, args: string[], cwd?: string, extraEnv?: Record<string, string | undefined>): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+        env: { ...process.env, ...this.environment, ...extraEnv, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> {
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is not configured')
+    return JSON.parse(await this.run(github.cli, args)) as T
+  }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +95,9 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is not configured')
+    if (typeof schema === 'string') return this.run(github.cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -95,6 +110,45 @@ export class Commands {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
     if (outside) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  private gitlabEnv(): { cli: string; env: Record<string, string> } {
+    const gitlab = this.deployment.gitlab
+    if (!gitlab) throw new Error('The GitLab Source is not configured')
+    return { cli: gitlab.cli, env: { GITLAB_HOST: gitlab.host, NO_PROMPT: '1' } }
+  }
+  private gitlabPath(path: string): string {
+    const outside = !path || /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)|%2e%2e/i.test(path)
+    if (outside) throw new Error('GitLab API calls must use relative v4 API paths')
+    return path
+  }
+  /** Runs the agent's GitLab CLI (`glab`) with GITLAB_HOST bound to the configured instance and parses its JSON output. */
+  async glab<T>(args: string[]): Promise<T> {
+    const { cli, env } = this.gitlabEnv()
+    return JSON.parse(await this.run(cli, args, undefined, env)) as T
+  }
+  /**
+   * Calls the GitLab REST API v4 on a relative path, validating JSON output when a schema is provided or returning raw CLI output.
+   * @throws CliError with GitLab's HTTP status as `code` on failure.
+   */
+  async gitlabApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async gitlabApi(path: string, ...flags: string[]): Promise<string>
+  async gitlabApi<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    const { cli, env } = this.gitlabEnv()
+    if (typeof schema === 'string') return this.run(cli, ['api', this.gitlabPath(schema), ...rest], undefined, env)
+    const [path = '', ...flags] = rest
+    return schema.parse(JSON.parse(await this.run(cli, ['api', this.gitlabPath(path), ...flags], undefined, env)))
+  }
+  /** Fetches pages of a GitLab REST API list (up to 20 pages of 100 items), skipping items that fail schema validation. */
+  async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const clean = this.gitlabPath(path)
+    const out: T[] = []
+    for (let page = 1; page <= 20; page++) {
+      const sep = clean.includes('?') ? '&' : '?'
+      const raw = await this.gitlabApi(z.array(z.unknown()), `${clean}${sep}per_page=100&page=${page}`)
+      out.push(...validItems(item, raw, tally))
+      if (raw.length < 100) break
+    }
+    return out
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

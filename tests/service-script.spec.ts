@@ -49,7 +49,7 @@ afterEach(() => {
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
-    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
+    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_HOME: join(root, 'dsh-home'), DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
@@ -231,4 +231,121 @@ it('does not signal a process that took the recorded service PID, and keeps a st
   processes(service(sleeper(true)))
   expect(await run('stop', '--stop-timeout', '1')).toMatchObject({ code: 1, stderr: expect.stringContaining('Graceful stop timed out') })
   expect(existsSync(join(control('superagent'), 'manually-stopped'))).toBe(true)
+}, 20_000)
+
+it('starts, checks /healthz, and stops the standalone GitLab webhook receiver when dsh-superagent-gitlab is enabled', async () => {
+  const stateDir = join(root, 'state')
+  mkdirSync(stateDir, { recursive: true })
+  const webhookServer = createServer((req, res) => {
+    if (req.url === '/healthz' && existsSync(join(root, 'launched-webhook'))) {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, queued: 0 }))
+      return
+    }
+    res.writeHead(503).end()
+  })
+  await new Promise<void>(resolve => webhookServer.listen(0, '127.0.0.1', resolve))
+  const webhookPort = (webhookServer.address() as AddressInfo).port
+  try {
+    const profileDir = join(root, 'dsh-home', 'profiles', 'superagent')
+    mkdirSync(profileDir, { recursive: true })
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), [
+      '- id: dsh-superagent',
+      '  config:',
+      `    stateDir: ${stateDir}`,
+      '    gitlabWebhookHost: 127.0.0.1',
+      `    gitlabWebhookPort: ${webhookPort}`,
+      '- id: dsh-superagent-gitlab',
+      '  disabled: false',
+      '',
+    ].join('\n'))
+
+    const dshPid = sleeper()
+    const webhookPid = sleeper()
+    const webhookLine = `${webhookPid} node node ${join(root, 'lib', 'gitlab-webhook.js')} --state-dir ${stateDir} --host 127.0.0.1 --port ${webhookPort}`
+    writeFileSync(join(root, 'pane'), `${dshPid}\n`)
+    writeFileSync(join(root, 'pane-webhook'), `${webhookPid}\n`)
+    program('tmux', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/tmux.log'; echo --- >> '${root}/tmux.log'\n`
+      + `case "$1" in has-session) [ -f '${root}/launched' ] && exit 0 || exit 1;; new-*) `
+      + `case "$*" in *"-n webhook"*) touch '${root}/launched-webhook'; printf '%s\\n' '${webhookLine}' >> '${root}/ps-started.txt'; cat '${root}/pane-webhook';; *) touch '${root}/launched'; cat '${root}/pane';; esac;; esac`)
+
+    const url = await answering()
+    started(service(dshPid))
+
+    const startRes = await run('start', '--url', url, '--timeout', '10')
+    expect(startRes.code).toBe(0)
+    const tmuxLog = readFileSync(join(root, 'tmux.log'), 'utf8')
+    expect(tmuxLog).toContain('webhook')
+    expect(tmuxLog).toContain('gitlab-webhook.js')
+    expect(readFileSync(join(control('superagent'), 'webhook.pid'), 'utf8')).toBe(`${webhookPid}\n`)
+
+    const statusRes = await run('status', '--url', url)
+    expect(statusRes.code).toBe(0)
+    expect(JSON.parse(statusRes.stdout)).toMatchObject({
+      pids: [dshPid],
+      webhook: { pids: [webhookPid], ok: true, url: `http://127.0.0.1:${webhookPort}/healthz` },
+    })
+
+    // If webhook dies while DSH stays up, status exits 1 so recovery triggers
+    started(service(dshPid))
+    const degraded = await run('status', '--url', url)
+    expect(degraded.code).toBe(1)
+
+    // Restore both in ps.txt and verify stop terminates both cleanly
+    rmSync(join(root, 'launched'))
+    processes(service(dshPid), webhookLine)
+    const stopRes = await run('stop', '--stop-timeout', '5')
+    expect(stopRes.code).toBe(0)
+    expect(existsSync(join(control('superagent'), 'webhook.pid'))).toBe(false)
+  } finally {
+    webhookServer.close()
+  }
+}, 20_000)
+
+it('does not start a webhook process when dsh-superagent-gitlab is disabled or absent', async () => {
+  const profileDir = join(root, 'dsh-home', 'profiles', 'superagent')
+  mkdirSync(profileDir, { recursive: true })
+  writeFileSync(join(profileDir, 'cordis.patch.yml'), [
+    '- id: dsh-superagent',
+    '  config:',
+    `    stateDir: ${join(root, 'state')}`,
+    '- id: dsh-superagent-gitlab',
+    '  disabled: true',
+    '',
+  ].join('\n'))
+  const url = await answering()
+  const pid = sleeper()
+  writeFileSync(join(root, 'pane'), `${pid}\n`)
+  started(service(pid))
+  const startRes = await run('start', '--url', url, '--timeout', '10')
+  expect(startRes.code).toBe(0)
+  expect(readFileSync(join(root, 'tmux.log'), 'utf8')).not.toContain('gitlab-webhook.js')
+  const st = JSON.parse((await run('status', '--url', url)).stdout) as Record<string, unknown>
+  expect(st.webhook).toBeUndefined()
+}, 20_000)
+
+it('stops a running orphaned webhook process even after dsh-superagent-gitlab is set to disabled in cordis.patch.yml', async () => {
+  const stateDir = join(root, 'state')
+  mkdirSync(stateDir, { recursive: true })
+  const profileDir = join(root, 'dsh-home', 'profiles', 'superagent')
+  mkdirSync(profileDir, { recursive: true })
+  writeFileSync(join(profileDir, 'cordis.patch.yml'), [
+    '- id: dsh-superagent',
+    '  config:',
+    `    stateDir: ${stateDir}`,
+    '- id: dsh-superagent-gitlab',
+    '  disabled: true',
+    '',
+  ].join('\n'))
+  const dshPid = sleeper()
+  const webhookPid = sleeper()
+  mkdirSync(control('superagent'), { recursive: true })
+  writeFileSync(join(control('superagent'), 'webhook.pid'), `${webhookPid}\n`)
+  processes(
+    service(dshPid),
+    `${webhookPid} node node ${join(root, 'lib', 'gitlab-webhook.js')} --state-dir ${stateDir} --host 127.0.0.1 --port 3083`,
+  )
+  const stopRes = await run('stop', '--stop-timeout', '5')
+  expect(stopRes.code).toBe(0)
+  expect(existsSync(join(control('superagent'), 'webhook.pid'))).toBe(false)
+  expect(() => process.kill(webhookPid, 0)).toThrow()
 }, 20_000)

@@ -34,6 +34,7 @@ import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
+import { mrEndNotices } from '../sources/gitlab-mr.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -70,7 +71,9 @@ export class Runtime extends Service implements SourceHost {
   readonly outbox: Outbox
   readonly engine: Engine
   readonly passes: Passes
-  readonly ready: Promise<void>
+  private readyPromise: Promise<void>
+  private startedConfigured = false
+  private recheckQueued = false
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   readonly masterId: string
@@ -96,19 +99,36 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
-      const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
+      const anyForgeRegistered = () => this.sources.kind('github') !== undefined || this.sources.kind('gitlab') !== undefined
+      const setup = this.setup = new Setup({
+        context: ctx, machine, lifetime: this.lifetime, restart,
+        hasSource: id => anyForgeRegistered()
+          ? this.sources.kind(id) !== undefined
+          : (id === 'github' ? store.settings().sources.github?.enabled !== false : id in store.settings().sources),
+      })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
-      const feishu = () => setup.configured() && !!setup.deployment.feishu
-      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
+      const activeSkills = {
+        github: () => setup.configured() ? !!setup.deployment.github : (this.sources.kind('github') !== undefined || this.sources.kind('gitlab') === undefined),
+        gitlab: () => setup.configured() ? !!setup.deployment.gitlab : this.sources.kind('gitlab') !== undefined,
+        feishu: () => setup.configured() && !!setup.deployment.feishu,
+      }
+      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, activeSkills)
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
+        if ((kind.kind === 'gitlab' || kind.kind === 'github') && !setup.configured() && !this.closing() && this.readyPromise && !this.recheckQueued) {
+          this.recheckQueued = true
+          this.readyPromise = this.readyPromise.then(() => {
+            this.recheckQueued = false
+            return this.recheckSetup()
+          })
+        }
         // Sync source member lists once startup completes when a source plugin loads dynamically.
-        if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
+        if (kind.policy?.sync) void this.readyPromise?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
           .catch(() => { /* sync() records its failure in health. */ })
         return () => {}
       })
@@ -144,11 +164,27 @@ export class Runtime extends Service implements SourceHost {
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
-          // Notify the ticket's conversations whenever it ends via a pull request.
+          // Notify the ticket's conversations whenever it ends via a pull request or merge request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
-            for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
+            if (setup.deployment.repository) {
+              for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
+            }
+            if (setup.deployment.gitlab) {
+              const lookupProjectPath = (projectId: number) => {
+                const origin = store.triggers.get(ended.origin.triggerId)
+                if (origin?.source === 'gitlab' && Number(origin.meta.projectId) === projectId && typeof origin.meta.projectPath === 'string') {
+                  return origin.meta.projectPath
+                }
+                for (const follow of ended.follows ?? []) {
+                  const meta = store.threads.get(follow.thread)?.meta
+                  if (meta && Number(meta.projectId) === projectId && typeof meta.projectPath === 'string') return meta.projectPath
+                }
+                return undefined
+              }
+              for (const message of mrEndNotices(ended, request, setup.deployment.gitlab.host, lookupProjectPath)) outbox.send(message)
+            }
           }
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
@@ -161,15 +197,17 @@ export class Runtime extends Service implements SourceHost {
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
+        get gitlab() { return runtime.context({ kind: 'gitlab', health: ['gitlab'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
-      this.ready = this.initialize()
+      this.readyPromise = this.initialize()
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.
       try { opened?.close() } finally { release() }
       throw error
     }
   }
+  get ready(): Promise<void> { return this.readyPromise }
   get health(): Readonly<Record<string, Health>> { return this.board.all }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
@@ -182,7 +220,11 @@ export class Runtime extends Service implements SourceHost {
   get feishuProblem(): SetupProblem | undefined { return this.setup.feishuProblem }
   links(): LinkTarget {
     const resolved = this.setup.configured() ? this.setup.deployment : undefined
-    const links = resolved ? { repository: resolved.repository, ...(resolved.feishu ? { feishu: resolved.feishu } : {}) } : {}
+    const links = resolved ? {
+      ...(resolved.repository ? { repository: resolved.repository } : {}),
+      ...(resolved.gitlab ? { gitlab: resolved.gitlab } : {}),
+      ...(resolved.feishu ? { feishu: resolved.feishu } : {}),
+    } : {}
     return channel => this.sources.link(channel, links)
   }
   ticketEnvironment(ticket: Ticket): Variable[] {
@@ -205,6 +247,20 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
+    await this.startConfigured()
+  }
+  /** Re-runs setup when a forge plugin (`github`/`gitlab`) registers after initial startup before setup completed. */
+  private async recheckSetup(): Promise<void> {
+    if (this.setup.configured() || this.closing()) return
+    if (!await this.setup.run(this.store.settings())) {
+      this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
+      return
+    }
+    await this.startConfigured()
+  }
+  private async startConfigured(): Promise<void> {
+    if (this.startedConfigured || this.closing()) return
+    this.startedConfigured = true
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
@@ -234,7 +290,7 @@ export class Runtime extends Service implements SourceHost {
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
+      await Promise.allSettled([this.readyPromise, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

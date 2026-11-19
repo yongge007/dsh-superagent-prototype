@@ -1,7 +1,7 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
 import { UserError } from '../core/index.ts'
-import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
+import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, resolveGitlabDeployment, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
@@ -11,6 +11,7 @@ export interface SetupHost {
   readonly machine: Machine
   readonly lifetime: AbortSignal
   restart(): void
+  hasSource?(id: string): boolean
 }
 
 const setupFields = (settings: Settings) =>
@@ -43,6 +44,8 @@ export class Setup {
   configured(): boolean { return this.resolved !== undefined }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
+    this.problem = undefined
+    this.feishuProblem = undefined
     try { this.resolved = await this.resolve(settings); return true }
     catch (error) {
       if (!(error instanceof SetupError)) throw error
@@ -60,9 +63,27 @@ export class Setup {
   /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
-    const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
-    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+    const glConfig = settings.sources.gitlab?.config ?? {}
+    const ghConfig = settings.sources.github?.config ?? {}
+    if (block === 'source:feishu') {
+      await resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
+        .catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === 'feishu') throw error })
+      return
+    }
+    if (block === 'source:gitlab') {
+      const host = typeof glConfig.host === 'string' ? glConfig.host.trim() : ''
+      const githubConfigured = settings.sources.github?.enabled !== false && Boolean(typeof ghConfig.repository === 'string' && ghConfig.repository.trim())
+      if (!host && (settings.sources.gitlab?.enabled === false || githubConfigured)) return
+      await resolveGitlabDeployment(machine, glConfig, this.probe())
+        .catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === 'gitlab') throw error })
+      return
+    }
+    const repo = typeof ghConfig.repository === 'string' ? ghConfig.repository.trim() : ''
+    const cli = typeof ghConfig.cli === 'string' ? ghConfig.cli.trim() : ''
+    const gitlabConfigured = settings.sources.gitlab?.enabled !== false && Boolean(typeof glConfig.host === 'string' && glConfig.host.trim())
+    if (!repo && !cli && (settings.sources.github?.enabled === false || gitlabConfigured)) return
+    await resolveDeployment(machine, ghConfig, this.probe())
+      .catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === 'github') throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)
@@ -76,19 +97,38 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    const gitlabInstalled = this.host.hasSource ? this.host.hasSource('gitlab') : Boolean(settings.sources.gitlab)
+    const githubInstalled = this.host.hasSource ? this.host.hasSource('github') : true
+    const gitlabEnabled = gitlabInstalled && settings.sources.gitlab?.enabled !== false
+    const githubEnabled = githubInstalled && settings.sources.github?.enabled !== false
+    const ghConfig = settings.sources.github?.config ?? {}
+    const glConfig = settings.sources.gitlab?.config ?? {}
+    const githubConfigured = githubEnabled && Boolean((typeof ghConfig.repository === 'string' && ghConfig.repository.trim()) || (typeof ghConfig.cli === 'string' && ghConfig.cli.trim()))
+    const gitlabConfigured = gitlabEnabled && Boolean(typeof glConfig.host === 'string' && glConfig.host.trim())
+    const needGithub = githubEnabled && (githubConfigured || !gitlabConfigured)
+    const needGitlab = gitlabEnabled && (gitlabConfigured || !needGithub)
+    if (!needGithub && !needGitlab) throw new SetupError('noForgeConfigured')
+    const githubPart = needGithub ? await resolveDeployment(machine, ghConfig, probe) : undefined
+    const gitlabPart = needGitlab ? await resolveGitlabDeployment(machine, glConfig, probe) : undefined
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
       context.logger.warn('dsh-superagent leaves Feishu out: %s', error.message)
       return undefined
     })
-    const resolved = { ...deployment, ...(feishu ? { feishu } : {}) }
+    const resolved: Deployment = {
+      ...machine,
+      ...(githubPart ? { repository: githubPart.repository, github: githubPart.github } : {}),
+      ...(gitlabPart ? { gitlab: gitlabPart } : {}),
+      ...(feishu ? { feishu } : {}),
+    }
     const machineProblem = (error: unknown): never => {
       if (error instanceof SetupError) throw error
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
+    if (lifetime.aborted) throw new SetupError('environmentFailed', { output: 'aborted' })
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
+    if (lifetime.aborted) throw new SetupError('environmentFailed', { output: 'aborted' })
     this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
     await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
       this.restore()
