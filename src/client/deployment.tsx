@@ -62,8 +62,14 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
         <p className="dt-error" role="status"><SetupMessage problem={setup.problem} lead /></p><CheckSetupButton />
       </div>}
       {showAccounts && <Section title={t('deploymentDerived')} hint={t('deploymentDerivedHint')}>
-        <KeyValues rows={[[t('deploymentRepository'), accounts?.repository ?? '—'],
-          [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
+        <KeyValues rows={[
+          ...(accounts?.repository || !accounts?.gitlab ? [
+            [t('deploymentRepository'), accounts?.repository || '—'] as [string, string],
+            [t('deploymentAgent'), accounts?.agent ? `@${accounts.agent}` : '—'] as [string, string],
+          ] : []),
+          ...(accounts?.gitlab ? [[t('source.gitlab'), `${accounts.gitlab.host} (@${accounts.gitlab.agent}, :${accounts.gitlab.webhookPort})`] as [string, string]] : []),
+          [t('deploymentFeishu'), feishu],
+        ]} />
         <Hint>{t('deploymentAccountsWhere')}</Hint>
       </Section>}
       <Section title={t('deploymentMachine')}>

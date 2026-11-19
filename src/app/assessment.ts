@@ -9,6 +9,7 @@ import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
 import { readRepositoryPath } from '../sources/github-read.ts'
+import { readGitlabRepositoryPath } from '../sources/gitlab-read.ts'
 import type { TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
 import { textPage } from './context.ts'
@@ -261,6 +262,11 @@ export class MasterAssessor implements Assessor {
         if (result.next) cursors.add(result.next)
         const next = result.next ? { trigger_id: trigger.id, resource: 'thread', cursor: result.next } : null
         body = JSON.stringify({ images: references, next_read: next, ...result.body })
+      }
+      else if (trigger.source === 'gitlab') {
+        const projectId = Number(trigger.meta.projectId)
+        if (!(projectId > 0)) throw new Error('GitLab trigger is missing a numeric projectId')
+        body = await readGitlabRepositoryPath(commands, projectId, read.path!, read.resource === 'directory' ? 'directory' : 'file')
       }
       else {
         body = await readRepositoryPath(commands, read.path!, read.resource === 'directory' ? 'directory' : 'file')

@@ -1,6 +1,6 @@
 /** Default deployment and machine fixtures for tests. */
 import type { Volatile } from '@deepseek-ai/cordis'
-import type { Deployment, Machine } from '../../src/deployment.ts'
+import type { Deployment, GithubDeployment, Machine } from '../../src/deployment.ts'
 
 /** Mutable Volatile reference for simulating live configuration updates. */
 export const reference = <T>(value: T): Volatile<T> & { set(next: T): void } => {
@@ -9,11 +9,13 @@ export const reference = <T>(value: T): Volatile<T> & { set(next: T): void } => 
 }
 export const testMachine = (overrides: Partial<Machine> = {}): Machine => ({
   stateDir: '/tmp/dsh-superagent-test', promptMaxChars: reference(100000), admissionContextMaxPages: reference(10),
-  admissionContextTimeoutMs: reference(15000), ...overrides,
+  admissionContextTimeoutMs: reference(15000), gitlabWebhookHost: '0.0.0.0', gitlabWebhookPort: 3083, ...overrides,
 })
-export const testDeployment = (overrides: Partial<Deployment> = {}): Deployment => ({
+export const testDeployment = <T extends Partial<Deployment> = Record<never, never>>(
+  overrides?: T,
+): Omit<Deployment & { repository: string; github: GithubDeployment }, keyof T> & T => ({
   ...testMachine(), repository: 'acme/widgets',
   github: { cli: '/bin/false', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' },
   feishu: { cli: '/bin/false', botId: 'ou_bot', appId: 'cli_bot', brand: 'feishu', name: 'Widgets Bot' },
   ...overrides,
-})
+}) as Omit<Deployment & { repository: string; github: GithubDeployment }, keyof T> & T

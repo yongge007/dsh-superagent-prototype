@@ -8,6 +8,7 @@ import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { SetupError } from './setup.ts'
+import { ensureWebhookToken, webhookTokenPath } from './webhook/gitlab-queue.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
@@ -20,6 +21,8 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
+  gitlabWebhookHost: s.string().default('0.0.0.0').description('Bind address of the standalone GitLab webhook receiver.'),
+  gitlabWebhookPort: s.number().min(1).max(65535).step(1).default(3083).description('Listening port of the standalone GitLab webhook receiver.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export interface Machine {
@@ -27,6 +30,8 @@ export interface Machine {
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  gitlabWebhookHost: string
+  gitlabWebhookPort: number
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -38,21 +43,38 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, gitlabWebhookHost, gitlabWebhookPort } = config
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, gitlabWebhookHost, gitlabWebhookPort }
 }
 
 export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
 })
+export const GitlabAccountsSchema = z.object({
+  host: z.string().trim().default(''),
+  cli: z.string().trim().default('glab'),
+})
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape),
+  gitlab: Object.keys(GitlabAccountsSchema.shape),
+  feishu: Object.keys(FeishuBotSchema.shape),
+}
 
+export interface GithubDeployment { cli: string; login: string; noreply: string }
+export interface GitlabDeployment {
+  host: string
+  cli: string
+  login: string
+  email?: string
+  webhook: { host: string; port: number; tokenFile: string }
+}
 export interface Deployment extends Machine {
-  repository: string
-  github: { cli: string; login: string; noreply: string }
+  repository?: string
+  github?: GithubDeployment
+  gitlab?: GitlabDeployment
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -84,7 +106,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment & { repository: string; github: GithubDeployment }> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -103,6 +125,40 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
   return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+const GitlabUser = z.object({ id: z.number().int().positive(), username: z.string().min(1), email: z.string().nullish() })
+/** Validate and normalize a self-hosted GitLab origin URL (`http://` or `https://`, without trailing slashes). */
+export function normalizeGitlabHost(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '')
+  if (!trimmed) throw new SetupError('gitlabHostUnset')
+  let url: URL
+  try { url = new URL(trimmed) } catch { throw new SetupError('gitlabHostUnset', { output: `Invalid GitLab URL: ${trimmed}` }) }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new SetupError('gitlabHostUnset', { output: `Unsupported GitLab URL protocol: ${url.protocol}` })
+  }
+  return url.origin
+}
+
+/** Verify the agent's GitLab CLI (`glab`) identity on the configured host and ensure the 0600 webhook secret token exists. */
+export async function resolveGitlabDeployment(machine: Machine, gitlab: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<GitlabDeployment> {
+  const accounts = GitlabAccountsSchema.parse(gitlab ?? {})
+  const host = normalizeGitlabHost(accounts.host)
+  if (!accounts.cli) throw new SetupError('gitlabCliUnset')
+  let cli: string
+  try { cli = executable(accounts.cli, path, workerBin(machine.stateDir)) } catch (error) { throw new SetupError('gitlabCliMissing', { output: reason(error) }) }
+  const text = await probe(['env', `GITLAB_HOST=${host}`, 'NO_PROMPT=1', cli, 'api', 'user'])
+    .catch((error: unknown) => { throw new SetupError('gitlabCliSignedOut', { host, output: reason(error) }) })
+  const user = parsed(GitlabUser, text)
+  if (!user) throw new SetupError('gitlabCliNoAccount', { host })
+  ensureWebhookToken(machine.stateDir)
+  return {
+    host,
+    cli,
+    login: user.username,
+    ...(user.email ? { email: user.email } : {}),
+    webhook: { host: machine.gitlabWebhookHost, port: machine.gitlabWebhookPort, tokenFile: webhookTokenPath(machine.stateDir) },
+  }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

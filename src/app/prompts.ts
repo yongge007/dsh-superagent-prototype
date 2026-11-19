@@ -23,7 +23,7 @@ const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.key
 /** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github'] as const
+  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/gitlab'] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -67,6 +67,7 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
     placeholders: ['{version}', '{mode}'] },
   'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
+  'skill/gitlab': { roles: BOTH, text: sourceSkills.gitlab },
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
@@ -118,7 +119,23 @@ export function composePrompt(config: PromptConfig, role: Role, environment?: st
   return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
 }
 export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+  return name === 'feishu' || name === 'github' || name === 'gitlab' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+}
+
+function adaptForGitlabOnly(text: string): string {
+  return text
+    .replace(
+      'Use gh for ALL GitHub operations, and commit as the author the Delivery requirements section names, otherwise as $DSH_SUPERAGENT_GITHUB_ACCOUNT with $DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL; both override local defaults.',
+      'Use glab for ALL GitLab operations, and commit as the author the Delivery requirements section names, otherwise as $DSH_SUPERAGENT_GITLAB_ACCOUNT with $DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL; both override local defaults.',
+    )
+    .replace('load the matching dsh-superagent skill for Feishu/GitHub.', 'load the matching dsh-superagent skill for Feishu/GitLab.')
+    .replace('Act only as the deployment\'s GitHub account.', 'Act only as the deployment\'s GitLab account.')
+}
+
+export interface ActiveSkills {
+  github?: () => boolean
+  gitlab?: () => boolean
+  feishu?: () => boolean
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -134,17 +151,27 @@ export class PromptConflict extends Error {}
  */
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
+  private readonly active: { github: () => boolean; gitlab: () => boolean; feishu: () => boolean }
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
-    private readonly feishu: () => boolean) {
+    active: (() => boolean) | ActiveSkills) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
+    this.active = typeof active === 'function'
+      ? { github: () => true, gitlab: () => false, feishu: active }
+      : { github: active.github ?? (() => true), gitlab: active.gitlab ?? (() => false), feishu: active.feishu ?? (() => false) }
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    const composed = composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    return !this.active.github() && this.active.gitlab() ? adaptForGitlabOnly(composed) : composed
   }
-  /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
+  /** Returns skills to register in every Session: active built-in Source skills followed by team skills. */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    const builtIn = [
+      ...this.active.feishu() ? ['feishu'] : [],
+      ...this.active.github() ? ['github'] : [],
+      ...this.active.gitlab() ? ['gitlab'] : [],
+    ]
+    return [...builtIn, ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
   }
   current(): PromptVersion {
     const revision = this.versions.revision()
@@ -195,8 +222,12 @@ export class Prompts {
   preview(value: unknown) {
     const config = this.validate(value)
     const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
-    return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
-      parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment) },
+    const gitlabOnly = !this.active.github() && this.active.gitlab()
+    const adapt = (text: string) => gitlabOnly ? adaptForGitlabOnly(text) : text
+    const partsOf = (role: Role) => promptParts(config, role, environment, role === 'orchestrator' ? policy : undefined)
+      .map(part => gitlabOnly ? { ...part, text: adapt(part.text) } : part)
+    return { orchestrator: adapt(composePrompt(config, 'orchestrator', environment, policy)), worker: adapt(composePrompt(config, 'worker', environment)),
+      parts: { orchestrator: partsOf('orchestrator'), worker: partsOf('worker') },
       skills: Object.fromEntries(this.skills(config)), scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
   }
   save(value: unknown, baseRevision: number, source: SettingsOrigin): PromptVersion {

@@ -78,6 +78,124 @@ def processes(profile):
     return found + [pid] if pid not in found and running(pid, profile) else found
 
 
+def unquote_yaml(value):
+    """Strip quotes and trailing inline YAML comments from a scalar value."""
+    text = value.strip()
+    if not text:
+        return ''
+    if len(text) >= 2 and text[0] in ('"', "'") and text[-1] == text[0]:
+        return text[1:-1]
+    return text.split(' #', 1)[0].strip()
+
+
+def parse_profile_patch(profile):
+    """Parse `$DSH_HOME/profiles/<profile>/cordis.patch.yml` for `stateDir`, `dsh-superagent-gitlab` enabled flag, and webhook host/port."""
+    dsh_home = Path(os.environ.get('DSH_HOME') or (Path.home() / '.dsh'))
+    patch = dsh_home / 'profiles' / profile / 'cordis.patch.yml'
+    try:
+        lines = patch.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return None
+    gitlab_enabled = False
+    state_dir = ''
+    host = os.environ.get('DSH_SUPERAGENT_GITLAB_WEBHOOK_HOST') or '0.0.0.0'
+    port_text = os.environ.get('DSH_SUPERAGENT_GITLAB_WEBHOOK_PORT') or '3083'
+    current_id = None
+    in_config = False
+    config_indent = 0
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        indent = len(raw) - len(raw.lstrip(' '))
+        if stripped.startswith('- '):
+            current_id = None
+            in_config = False
+            rest = stripped[2:].strip()
+            if rest.startswith('id:'):
+                current_id = unquote_yaml(rest[3:])
+            continue
+        if in_config and indent <= config_indent:
+            in_config = False
+        if not in_config:
+            if stripped.startswith('id:'):
+                current_id = unquote_yaml(stripped[3:])
+            elif stripped.startswith('disabled:') and current_id == 'dsh-superagent-gitlab':
+                gitlab_enabled = unquote_yaml(stripped[9:]).lower() == 'false'
+            elif stripped.split('#', 1)[0].strip() == 'config:' and current_id == 'dsh-superagent':
+                in_config = True
+                config_indent = indent
+        else:
+            if stripped.startswith('stateDir:'):
+                state_dir = unquote_yaml(stripped[9:])
+            elif stripped.startswith('gitlabWebhookHost:'):
+                host = unquote_yaml(stripped[18:]) or host
+            elif stripped.startswith('gitlabWebhookPort:'):
+                port_text = unquote_yaml(stripped[18:]) or port_text
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = 3083
+    return {'gitlab_enabled': gitlab_enabled, 'state_dir': state_dir, 'host': host, 'port': port}
+
+
+def profile_state_dir(profile):
+    """Return the configured `stateDir` for `profile` regardless of whether GitLab is currently enabled."""
+    parsed = parse_profile_patch(profile)
+    return parsed['state_dir'] if parsed and parsed['state_dir'] else None
+
+
+def profile_gitlab_config(profile):
+    """Inspect `$DSH_HOME/profiles/<profile>/cordis.patch.yml` for an enabled `dsh-superagent-gitlab` entry and webhook config."""
+    parsed = parse_profile_patch(profile)
+    if not parsed or not parsed['gitlab_enabled'] or not parsed['state_dir']:
+        return None
+    return {'state_dir': parsed['state_dir'], 'host': parsed['host'], 'port': parsed['port']}
+
+
+def serves_webhook(args, state_dir):
+    """Return whether command-line arguments belong to the GitLab webhook receiver for `state_dir`."""
+    joined = ' '.join(args)
+    normalized = ' '.join(state_dir.split())
+    return 'gitlab-webhook.js' in joined and (f'--state-dir {normalized}' in joined or f'--state-dir={normalized}' in joined)
+
+
+def webhook_running(pid, state_dir):
+    """Return whether `pid` is currently running the GitLab webhook receiver for `state_dir` (or any gitlab-webhook.js if state_dir is None)."""
+    return any(
+        found == pid and name == 'node' and (serves_webhook(args, state_dir) if state_dir else 'gitlab-webhook.js' in ' '.join(args))
+        for found, name, args in ps('-p', str(pid))
+    )
+
+
+def webhook_processes(profile, state_dir):
+    """Return PIDs of running GitLab webhook receiver processes for `profile` / `state_dir`."""
+    found = [pid for pid, name, args in ps('-ax', check=True) if state_dir and name == 'node' and serves_webhook(args, state_dir)]
+    try:
+        pid = int((control(profile) / 'webhook.pid').read_text())
+    except (OSError, ValueError):
+        return found
+    return found + [pid] if pid not in found and webhook_running(pid, state_dir) else found
+
+
+def webhook_health(port):
+    """Return True when the local GitLab webhook receiver responds OK on `/healthz`."""
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=2) as response:
+            value = json.load(response)
+        return isinstance(value, dict) and value.get('ok') is True
+    except (OSError, ValueError):
+        return False
+
+
+def webhook_status(profile, cfg):
+    """Return webhook status dict when GitLab is enabled in the profile, else None."""
+    if not cfg:
+        return None
+    pids = webhook_processes(profile, cfg['state_dir'])
+    return {'pids': pids, 'url': f"http://127.0.0.1:{cfg['port']}/healthz", 'ok': bool(pids) and webhook_health(cfg['port'])}
+
+
 def state(url):
     """Fetch health and setup status from the management API, or return None if unreachable."""
     request = urllib.request.Request(url.rstrip('/') + '/orchestrator/api/state',
@@ -109,9 +227,11 @@ def part_errors(current):
     return {name: detail for name, detail in sorted(current['errors'].items()) if name != 'runtime'}
 
 
-def outcome(pids, current):
-    """Compute the CLI exit code from running PIDs and management API state."""
+def outcome(pids, current, webhook=None):
+    """Compute the CLI exit code from running PIDs, management API state, and optional webhook receiver status."""
     if len(pids) != 1 or not runtime_up(current):
+        return 1
+    if webhook is not None and (len(webhook['pids']) != 1 or not webhook['ok']):
         return 1
     if current['setup']:
         return SETUP_WAITS
@@ -122,42 +242,83 @@ def outcome(pids, current):
 def status(args):
     pids = processes(args.profile)
     current = state(args.url) if pids else None
-    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
-                      'manually_stopped': stopped(args.profile), 'health': current and current['health'],
-                      'errors': current and current['errors'], 'setup': current and current['setup'],
-                      'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
-    return outcome(pids, current)
+    webhook = webhook_status(args.profile, profile_gitlab_config(args.profile))
+    payload = {'pids': pids, 'cwd': str(ROOT), 'url': args.url,
+               'manually_stopped': stopped(args.profile), 'health': current and current['health'],
+               'errors': current and current['errors'], 'setup': current and current['setup'],
+               'feishu': current and current['feishu']}
+    if webhook is not None:
+        payload['webhook'] = webhook
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return outcome(pids, current, webhook)
 
 
 def stop(args, intentional=True):
-    """Stop the service gracefully, recording a manual stop marker when `intentional` is True."""
+    """Stop the service (and any running GitLab webhook receiver for this profile) gracefully, recording a manual stop marker when `intentional` is True."""
+    state_dir = profile_state_dir(args.profile)
     pids = processes(args.profile)
+    wpids = webhook_processes(args.profile, state_dir)
     if len(pids) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to choose one.')
+    if len(wpids) > 1:
+        raise RuntimeError('Multiple gitlab-webhook processes found; refusing to choose one.')
     # Write the stop marker before waiting so monitors respect the intentional stop even if graceful shutdown times out.
     if intentional:
         (control(args.profile) / 'manually-stopped').write_text(time.strftime('%Y-%m-%dT%H:%M:%S%z') + '\n')
-    for pid in pids:
+    for pid in pids + wpids:
         os.kill(pid, signal.SIGINT)
     deadline = time.monotonic() + args.stop_timeout
-    while any(running(pid, args.profile) for pid in pids):
+    while any(running(pid, args.profile) for pid in pids) or any(webhook_running(pid, state_dir) for pid in wpids):
         if time.monotonic() >= deadline:
             raise RuntimeError('Graceful stop timed out; no forced kill was sent. Check status.')
         time.sleep(0.5)
     (control(args.profile) / 'service.pid').unlink(missing_ok=True)
+    (control(args.profile) / 'webhook.pid').unlink(missing_ok=True)
     print('dsh-superagent stopped. Automatic recovery is paused until start/restart.' if intentional else 'dsh-superagent stopped.')
 
 
-def prune_logs(profile):
-    """Retain only the newest `KEEP_LOGS` log files for `profile`."""
-    name = re.compile(re.escape(f'dsh-superagent-{profile}-') + r'\d{8}-\d{6}-\d+\.log')
+def prune_logs(profile, suffix=''):
+    """Retain only the newest `KEEP_LOGS` log files for `profile` (and optional component `suffix`)."""
+    name = re.compile(re.escape(f'dsh-superagent-{profile}{suffix}-') + r'\d{8}-\d{6}-\d+\.log')
     logs = sorted((path for path in ARTIFACTS.iterdir() if name.fullmatch(path.name)), key=lambda path: path.stat().st_mtime)
     for path in logs[:-KEEP_LOGS]:
         path.unlink(missing_ok=True)
 
 
+def start_webhook(args, session, cfg):
+    """Ensure the standalone GitLab webhook receiver is running in the `webhook` tmux window."""
+    wpids = webhook_processes(args.profile, cfg['state_dir'])
+    if len(wpids) > 1:
+        raise RuntimeError('Multiple gitlab-webhook processes found; refusing to start another.')
+    if wpids:
+        (control(args.profile) / 'webhook.pid').write_text(f'{wpids[0]}\n')
+        print(f'gitlab-webhook already running (PID {wpids[0]}); no duplicate started.', flush=True)
+        return
+    node = shutil.which('node')
+    if not node or not shutil.which('tmux'):
+        raise RuntimeError('Both node and tmux must be on PATH for gitlab-webhook.')
+    if webhook_health(cfg['port']):
+        raise RuntimeError('An existing gitlab-webhook answers on this port; refusing duplicate startup.')
+    exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session], capture_output=True).returncode == 0
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    log = ARTIFACTS / f'dsh-superagent-{args.profile}-webhook-{stamp}-{os.getpid()}.log'
+    log.touch()
+    prune_logs(args.profile, '-webhook')
+    script = ROOT / 'lib' / 'gitlab-webhook.js'
+    command = ('umask 077; exec '
+               + shlex.join([node, str(script), '--state-dir', cfg['state_dir'], '--host', cfg['host'], '--port', str(cfg['port'])])
+               + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
+    target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
+    pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'webhook', '-c', str(ROOT), command],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    if pane.isdigit():
+        (control(args.profile) / 'webhook.pid').write_text(pane + '\n')
+    print('Webhook log: ' + str(log), flush=True)
+
+
 def start(args):
     session = 'dsh-' + args.profile
+    cfg = profile_gitlab_config(args.profile)
     pids = processes(args.profile)
     if len(pids) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
@@ -186,11 +347,14 @@ def start(args):
     else:
         (control(args.profile) / 'service.pid').write_text(f'{pids[0]}\n')
         print(f'dsh-superagent already running (PID {pids[0]}); no duplicate started.', flush=True)
+    if cfg:
+        start_webhook(args, session, cfg)
     (control(args.profile) / 'manually-stopped').unlink(missing_ok=True)
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         current = state(args.url)
-        if processes(args.profile) and runtime_up(current):
+        webhook_ready = cfg is None or (bool(webhook_processes(args.profile, cfg['state_dir'])) and webhook_health(cfg['port']))
+        if processes(args.profile) and runtime_up(current) and webhook_ready:
             code = status(args)
             if current['setup']:
                 print('dsh-superagent is waiting for setup: ' + str(current['setup'].get('detail', '')))

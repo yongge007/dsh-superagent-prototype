@@ -15,6 +15,8 @@
     },
     "./client": "./lib/client.js",
     "./github-watch": "./lib/github-watch.js",
+    "./gitlab-watch": "./lib/gitlab-watch.js",
+    "./gitlab-webhook": "./lib/gitlab-webhook.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
